@@ -514,12 +514,10 @@
     else delete att.status.dataset.kind;
   }
 
-  async function post(box) {
-    const att = attachments.get(box);
-    const editor = editorOf(box);
-    const submit = submitOf(box);
-    if (!att || att.posting || !editor || !submit) return;
-
+  // Presses Comment once, exactly as a person would, and returns main.js's
+  // verdict: { ok, error } or null if nothing came back. `state.cancelled`
+  // lets the caller stop waiting.
+  async function postOnce(att, editor, submit) {
     const nonce = newNonce();
     const marker = `[[gif:${att.gif.id}:${nonce}]]`;
     let settle;
@@ -533,20 +531,15 @@
       else if (msg.type === 'seen') seen = true;
       else if (msg.type === 'result') settle(msg);
     });
-
-    att.posting = true;
-    att.chip.toggleAttribute('data-busy', true);
-    setChipStatus(att, 'Posting…');
     try {
       toMain({ type: 'arm', id: att.gif.id, nonce });
       // Without the page hook the marker would be posted as plain text, so
       // nothing is typed into the box until the hook has answered.
       const armed = await Promise.race([armedPromise, sleep(ARM_TIMEOUT_MS).then(() => false)]);
       if (armed !== true) {
-        setChipStatus(att, armed === 'refused'
+        return { ok: false, fatal: true, error: armed === 'refused'
           ? 'Not ready in this tab yet. Try again in a few seconds, or refresh this page.'
-          : 'The page hook is not running. Refresh this page and try again.', 'error');
-        return;
+          : 'The page hook is not running. Refresh this page and try again.' };
       }
 
       appendMarker(editor, marker);
@@ -556,17 +549,47 @@
 
       let result = await Promise.race([settled, sleep(SUBMIT_GRACE_MS).then(() => null)]);
       if (!result && seen) result = await Promise.race([settled, sleep(RESULT_TIMEOUT_MS).then(() => null)]);
-
-      if (result && result.ok) {
-        detach(box, false);
-        return;
-      }
+      if (result && result.ok) return result;
       // Failed or never sent: take the marker back out of the box.
       toMain({ type: 'disarm', nonce });
       if (editor.isConnected) removeMarker(editor, marker);
-      setChipStatus(att, (result && result.error) || 'The GIF was not sent. Nothing was posted.', 'error');
+      return result;
     } finally {
       fromMain.delete(nonce);
+    }
+  }
+
+  // YouTube turns a GIF down at random, and pressing Comment again usually
+  // gets it through. So a refusal is retried, the same way, until it posts or
+  // the person presses Cancel.
+  const REFUSED = /does not accept this GIF/;
+
+  async function post(box) {
+    const att = attachments.get(box);
+    const editor = editorOf(box);
+    const submit = submitOf(box);
+    if (!att || att.posting || !editor || !submit) return;
+
+    att.posting = true;
+    att.cancelled = false;
+    att.chip.toggleAttribute('data-busy', true);
+    try {
+      for (let attempt = 1; ; attempt++) {
+        setChipStatus(att, attempt === 1 ? 'Posting…' : `YouTube refused the GIF, trying again (attempt ${attempt}). Press Cancel to stop.`);
+        const result = await postOnce(att, editor, submit);
+        if (result && result.ok) {
+          detach(box, false);
+          return;
+        }
+        const retry = result && !result.fatal && REFUSED.test(result.error || '');
+        if (!retry || att.cancelled || !box.isConnected || !editor.isConnected) {
+          setChipStatus(att, att.cancelled ? 'Cancelled. Nothing was posted.'
+            : (result && result.error) || 'The GIF was not sent. Nothing was posted.', 'error');
+          return;
+        }
+        await sleep(400);
+      }
+    } finally {
       att.posting = false;
       att.chip.toggleAttribute('data-busy', false);
     }
@@ -587,8 +610,10 @@
       e.preventDefault();
       e.stopImmediatePropagation();
       post(box);
-    } else if (cancel && path.includes(cancel) && !attachments.get(box).posting) {
-      detach(box, false);
+    } else if (cancel && path.includes(cancel)) {
+      const att = attachments.get(box);
+      if (att.posting) att.cancelled = true;
+      else detach(box, false);
     }
   }, true);
 
